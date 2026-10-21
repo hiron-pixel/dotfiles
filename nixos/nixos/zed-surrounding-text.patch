@@ -1,0 +1,1184 @@
+--- a/crates/editor/src/editor.rs
++++ b/crates/editor/src/editor.rs
+@@ -981,6 +981,8 @@
+     /// When inline assist editors are linked, they all render cursors because
+     /// typing enters text into each of them, even the ones that aren't focused.
+     pub(crate) show_cursor_when_unfocused: bool,
++    wayland_preedit_cursor_hidden: bool,
++    wayland_preedit_active: bool,
+     columnar_selection_state: Option<ColumnarSelectionState>,
+     add_selections_state: Option<AddSelectionsState>,
+     select_next_state: Option<SelectNextState>,
+@@ -2351,6 +2353,8 @@
+         let mut editor = Self {
+             focus_handle,
+             show_cursor_when_unfocused: false,
++            wayland_preedit_cursor_hidden: false,
++            wayland_preedit_active: false,
+             last_focused_descendant: None,
+             buffer: multi_buffer.clone(),
+             display_map: display_map.clone(),
+@@ -9927,7 +9931,8 @@
+     }
+ 
+     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
+-        (self.read_only(cx) || self.blink_manager.read(cx).visible())
++        !self.wayland_preedit_cursor_hidden
++            && (self.read_only(cx) || self.blink_manager.read(cx).visible())
+             && self.focus_handle.is_focused(window)
+     }
+ 
+@@ -10987,6 +10992,7 @@
+     }
+ 
+     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        self.cancel_wayland_composition(window, cx);
+         self.cursor_animations.clear();
+         self.blink_manager.update(cx, BlinkManager::disable);
+         self.buffer
+--- a/crates/editor/src/input.rs
++++ b/crates/editor/src/input.rs
+@@ -3,6 +3,40 @@
+ const ORDERED_LIST_MAX_MARKER_LEN: usize = 16;
+ 
+ impl Editor {
++    pub(super) fn cancel_wayland_composition(
++        &mut self,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if !self.wayland_preedit_active {
++            return;
++        }
++        let Some(range) = self.marked_text_range(window, cx) else {
++            return;
++        };
++        let mut adjusted = None;
++        let Some(expected) = self.text_for_range(range.clone(), &mut adjusted, window, cx) else {
++            return;
++        };
++        if adjusted.is_some() {
++            return;
++        }
++        self.apply_wayland_ime(
++            gpui::WaylandImeEdit {
++                cancel: true,
++                cursor_hidden: false,
++                range,
++                expected,
++                text: String::new(),
++                marked: 0..0,
++                selection: 0..0,
++                committed: None,
++            },
++            window,
++            cx,
++        );
++    }
++
+     pub fn set_input_enabled(&mut self, input_enabled: bool) {
+         self.input_enabled = input_enabled;
+     }
+@@ -2781,6 +2815,136 @@
+ }
+ 
+ impl EntityInputHandler for Editor {
++    fn supports_wayland_surrounding(
++        &mut self,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> bool {
++        if !self.input_enabled
++            || self.read_only(cx)
++            || self.display_map.read(cx).masked
++            || !self.buffer.read(cx).is_singleton()
++        {
++            return false;
++        }
++        let selections = self
++            .selections
++            .all::<MultiBufferOffsetUtf16>(&self.display_snapshot(cx));
++        if selections.len() != 1 {
++            return false;
++        }
++        let selection = &selections[0];
++        if selection.start == selection.end {
++            return true;
++        }
++        // A preedit may have an internal selection. Other selections are outside
++        // this first patch's surrounding-edit scope.
++        self.marked_text_range(window, cx).is_some_and(|marked| {
++            marked.start <= selection.start.0.0 && selection.end.0.0 <= marked.end
++        })
++    }
++
++    fn apply_wayland_ime(
++        &mut self,
++        edit: gpui::WaylandImeEdit,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> bool {
++        if edit.cancel {
++            if !edit.text.is_empty()
++                || edit.committed.is_some()
++                || self.marked_text_range(window, cx) != Some(edit.range.clone())
++                || self.read_only(cx)
++            {
++                return false;
++            }
++        } else if !self.supports_wayland_surrounding(window, cx) {
++            return false;
++        }
++        let mut adjusted = None;
++        if self
++            .text_for_range(edit.range.clone(), &mut adjusted, window, cx)
++            .as_deref()
++            != Some(edit.expected.as_str())
++            || adjusted.is_some()
++        {
++            return false;
++        }
++        let text_len = edit.text.encode_utf16().count();
++        if edit.marked.start > edit.marked.end
++            || edit.marked.end > text_len
++            || edit.selection.start > text_len
++            || edit.selection.end > text_len
++        {
++            return false;
++        }
++        self.wayland_preedit_cursor_hidden = edit.cursor_hidden;
++        self.wayland_preedit_active = !edit.marked.is_empty();
++        let head = self
++            .selections
++            .newest::<MultiBufferOffsetUtf16>(&self.display_snapshot(cx))
++            .head()
++            .0
++            .0;
++        let insertion = edit.range.start;
++        self.transact(window, cx, |this, window, cx| {
++            let preserved_selections = edit.cancel.then(|| this.selections.disjoint_anchors_arc());
++            this.clear_highlights(HighlightKey::InputComposition, cx);
++            this.buffer.update(cx, |buffer, cx| {
++                buffer.edit(
++                    [(
++                        MultiBufferOffsetUtf16(OffsetUtf16(edit.range.start))
++                            ..MultiBufferOffsetUtf16(OffsetUtf16(edit.range.end)),
++                        edit.text.clone(),
++                    )],
++                    None,
++                    cx,
++                );
++            });
++            if edit.marked.start != edit.marked.end {
++                let snapshot = this.buffer.read(cx).read(cx);
++                let start = MultiBufferOffsetUtf16(OffsetUtf16(insertion + edit.marked.start));
++                let end = MultiBufferOffsetUtf16(OffsetUtf16(insertion + edit.marked.end));
++                let marked = snapshot.anchor_before(start)..snapshot.anchor_after(end);
++                drop(snapshot);
++                this.highlight_text(
++                    HighlightKey::InputComposition,
++                    vec![marked],
++                    HighlightStyle {
++                        underline: Some(UnderlineStyle {
++                            thickness: px(1.),
++                            color: None,
++                            wavy: false,
++                        }),
++                        ..Default::default()
++                    },
++                    cx,
++                );
++            }
++            let start = MultiBufferOffsetUtf16(OffsetUtf16(insertion + edit.selection.start));
++            let end = MultiBufferOffsetUtf16(OffsetUtf16(insertion + edit.selection.end));
++            this.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
++                if let Some(preserved) = preserved_selections {
++                    selections.select_anchors(preserved.iter().cloned().collect());
++                } else {
++                    selections.select_ranges([start..end]);
++                }
++            });
++            if let Some(committed) = &edit.committed {
++                cx.emit(EditorEvent::InputHandled {
++                    utf16_range_to_replace: Some(
++                        (edit.range.start as isize - head as isize)
++                            ..(edit.range.end as isize - head as isize),
++                    ),
++                    text: committed.clone().into(),
++                });
++            }
++        });
++        // Each done is one edit transaction; do not reuse macOS composition state.
++        self.ime_transaction.take();
++        true
++    }
++
+     fn text_for_range(
+         &mut self,
+         range_utf16: Range<usize>,
+@@ -2836,6 +3000,8 @@
+     }
+ 
+     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
++        self.wayland_preedit_active = false;
++        self.wayland_preedit_cursor_hidden = false;
+         self.clear_highlights(HighlightKey::InputComposition, cx);
+         self.ime_transaction.take();
+     }
+--- a/crates/gpui/src/input.rs
++++ b/crates/gpui/src/input.rs
+@@ -11,6 +11,25 @@
+ ///
+ /// See [`InputHandler`] for details on how to implement each method.
+ pub trait EntityInputHandler: 'static + Sized {
++    /// Opt in only when literal surrounding edits can be represented by this view.
++    fn supports_wayland_surrounding(
++        &mut self,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> bool {
++        false
++    }
++
++    /// Apply a literal Wayland IME transaction.
++    fn apply_wayland_ime(
++        &mut self,
++        _edit: crate::WaylandImeEdit,
++        _window: &mut Window,
++        _cx: &mut Context<Self>,
++    ) -> bool {
++        false
++    }
++
+     /// See [`InputHandler::text_for_range`] for details
+     fn text_for_range(
+         &mut self,
+@@ -143,6 +162,25 @@
+ }
+ 
+ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
++    fn supports_wayland_surrounding(&mut self, window: &mut Window, cx: &mut App) -> bool {
++        self.view
++            .update(cx, |view, cx| view.supports_wayland_surrounding(window, cx))
++    }
++
++    fn apply_wayland_ime(
++        &mut self,
++        edit: crate::WaylandImeEdit,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> bool {
++        self.view
++            .update(cx, |view, cx| view.apply_wayland_ime(edit, window, cx))
++    }
++
++    fn wayland_input_context(&self) -> Option<crate::EntityId> {
++        Some(self.view.entity_id())
++    }
++
+     fn selected_text_range(
+         &mut self,
+         ignore_disabled_input: bool,
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1677,6 +1677,22 @@
+     allow(dead_code)
+ )]
+ impl PlatformInputHandler {
++    pub fn supports_wayland_surrounding(&mut self) -> bool {
++        self.cx
++            .update(|window, cx| self.handler.supports_wayland_surrounding(window, cx))
++            .unwrap_or(false)
++    }
++
++    pub fn apply_wayland_ime(&mut self, edit: WaylandImeEdit) -> bool {
++        self.cx
++            .update(|window, cx| self.handler.apply_wayland_ime(edit, window, cx))
++            .unwrap_or(false)
++    }
++
++    pub fn wayland_input_context(&self) -> Option<crate::EntityId> {
++        self.handler.wayland_input_context()
++    }
++
+     pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
+         Self { cx, handler }
+     }
+@@ -1916,11 +1932,54 @@
+     pub reversed: bool,
+ }
+ 
++/// A literal, single-cursor edit delivered by Wayland text-input-v3.
++/// Offsets are UTF-16 document offsets; marked and selection are relative to text.
++#[derive(Clone, Debug)]
++pub struct WaylandImeEdit {
++    /// Cancellation may remove an existing preedit after leaving Insert mode.
++    pub cancel: bool,
++    /// Hide the caret inside the new preedit (-1/-1 in the protocol).
++    pub cursor_hidden: bool,
++    /// Original document range, including the old preedit.
++    pub range: Range<usize>,
++    /// Text that must still occupy range before applying the edit.
++    pub expected: String,
++    /// Committed text followed by the new preedit.
++    pub text: String,
++    /// New preedit range relative to text, in UTF-16 code units.
++    pub marked: Range<usize>,
++    /// New selection relative to text, in UTF-16 code units.
++    pub selection: Range<usize>,
++    /// Committed text for Vim insertion recording (preedit is excluded).
++    pub committed: Option<String>,
++}
++
+ /// Zed's interface for handling text input from the platform's IME system
+ /// This is currently a 1:1 exposure of the NSTextInputClient API:
+ ///
+ /// <https://developer.apple.com/documentation/appkit/nstextinputclient>
+ pub trait InputHandler: 'static {
++    /// Whether this input accepts literal Wayland surrounding edits right now.
++    /// Defaults to false: widgets must explicitly opt in.
++    fn supports_wayland_surrounding(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
++        false
++    }
++
++    /// Apply one validated text-input-v3 done transaction without key bindings.
++    fn apply_wayland_ime(
++        &mut self,
++        _edit: WaylandImeEdit,
++        _window: &mut Window,
++        _cx: &mut App,
++    ) -> bool {
++        false
++    }
++
++    /// Identity of the logical input, independent of the containing OS surface.
++    fn wayland_input_context(&self) -> Option<crate::EntityId> {
++        None
++    }
++
+     /// Get the range of the user's currently selected text, if any
+     /// Corresponds to [selectedRange()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438242-selectedrange)
+     ///
+--- a/crates/gpui_linux/src/linux/wayland/client.rs
++++ b/crates/gpui_linux/src/linux/wayland/client.rs
+@@ -75,6 +75,7 @@
+ use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
+ use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
+ 
++use super::surrounding::{Pending, SerialState, Surrounding};
+ use super::{
+     display::WaylandDisplay,
+     window::{ImeInput, WaylandWindowStatePtr},
+@@ -330,6 +331,16 @@
+     ime_pre_edit: Option<String>,
+     composing: bool,
+     last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
++    ime_serial: SerialState,
++    ime_pending: Pending,
++    ime_entered: bool,
++    ime_context: Option<gpui::EntityId>,
++    ime_window: Option<WaylandWindowStatePtr>,
++    ime_surrounding: Option<Surrounding>,
++    ime_observed_surrounding: Option<Surrounding>,
++    ime_external_change: bool,
++    ime_pending_rectangle: Option<ImeCursorRectangle>,
++    ime_applying: bool,
+     // Surface to Window mapping
+     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
+     // Output to scale mapping
+@@ -621,57 +632,145 @@
+     }
+ 
+     pub fn enable_ime(&self) {
+-        let client = self.get_client();
+-        let mut state = client.borrow_mut();
+-        state.ime_enabled = Some(true);
+-        state.last_ime_cursor_rectangle = None;
+-        let Some(text_input) = state.text_input.take() else {
+-            return;
+-        };
+-
+-        text_input.enable();
+-        text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
+-        let mut cursor_rectangle = None;
+-        if let Some(window) = state.keyboard_focused_window.clone() {
+-            drop(state);
+-            if let Some(area) = window.get_ime_area() {
+-                let area = ImeCursorRectangle::from(area);
+-                set_ime_cursor_rectangle(&text_input, area);
+-                cursor_rectangle = Some(area);
+-            }
+-            state = client.borrow_mut();
+-        }
+-        text_input.commit();
+-        state.last_ime_cursor_rectangle = cursor_rectangle;
+-        state.text_input = Some(text_input);
++        self.sync_ime_state(false);
+     }
+ 
+     pub fn disable_ime(&self) {
+         let client = self.get_client();
+         let mut state = client.borrow_mut();
++        let old_window = state.ime_window.take();
++        let old_context = state.ime_context.take();
++        let had_surrounding = state.ime_surrounding.take().is_some();
++        state.ime_observed_surrounding = None;
++        state.ime_external_change = false;
++        if state.ime_enabled == Some(true) {
++            if let Some(text_input) = state.text_input.clone() {
++                text_input.disable();
++                text_input.commit();
++                state.ime_serial.committed(false);
++            }
++        }
+         state.ime_enabled = Some(false);
++        state.ime_pending = Pending::default();
++        state.ime_serial.deferred = false;
+         state.composing = false;
+-        if let Some(text_input) = &state.text_input {
+-            text_input.disable();
+-            text_input.commit();
++        state.ime_pre_edit = None;
++        state.last_ime_cursor_rectangle = None;
++        state.ime_pending_rectangle = None;
++        drop(state);
++        if had_surrounding {
++            if let Some(window) = old_window {
++                if window.ime_context() == old_context {
++                    window.cancel_surrounding_preedit();
++                }
++            }
+         }
+     }
+ 
+     pub fn ime_enabled(&self) -> Option<bool> {
++        self.get_client().borrow().ime_enabled
++    }
++
++    /// Synchronize from the painted input handler, including same-coordinate edits.
++    /// ime_change is true only directly after applying a done batch.
++    pub fn sync_ime_state(&self, ime_change: bool) {
+         let client = self.get_client();
+-        client.borrow().ime_enabled
+-    }
+-
+-    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+-        let client = self.get_client();
++        let state = client.borrow();
++        if !state.ime_entered || state.ime_applying {
++            return;
++        }
++        let Some(window) = state.keyboard_focused_window.clone() else {
++            drop(state);
++            self.disable_ime();
++            return;
++        };
++        drop(state);
++        if !window.accepts_ime() {
++            self.disable_ime();
++            return;
++        }
++        let context = window.ime_context();
++        let area = window.get_ime_area().map(ImeCursorRectangle::from);
++        let mut surrounding = window.surrounding_text();
+         let mut state = client.borrow_mut();
+-        if state.pre_edit_text.is_some() {
++        let same_window = state
++            .ime_window
++            .as_ref()
++            .is_some_and(|old| old.ptr_eq(&window));
++        let reset = state.ime_enabled != Some(true)
++            || !same_window
++            || state.ime_context != context
++            || state.ime_surrounding.is_some() != surrounding.is_some();
++        if reset {
++            drop(state);
++            self.disable_ime();
++            // Cancellation may have removed a preedit from this same input.
++            surrounding = window.surrounding_text();
++            state = client.borrow_mut();
++            let Some(text_input) = state.text_input.clone() else {
++                return;
++            };
++            text_input.enable();
++            text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
++            state.ime_enabled = Some(true);
++            state.ime_window = Some(window.clone());
++            state.ime_context = context;
++            state.last_ime_cursor_rectangle = None;
++            state.ime_serial.deferred = false;
++        }
++        if !ime_change && state.ime_observed_surrounding != surrounding {
++            state.ime_external_change = true;
++        }
++        state.ime_observed_surrounding = surrounding.clone();
++        if state.ime_serial.deferred {
+             return;
+         }
+         let Some(text_input) = state.text_input.clone() else {
+             return;
+         };
+-        update_ime_cursor_rectangle(&text_input, &mut state.last_ime_cursor_rectangle, bounds);
++        let changed = match (&surrounding, &state.ime_surrounding) {
++            (Some(new), Some(old)) => {
++                new.text != old.text
++                    || new.cursor != old.cursor
++                    || new.start_utf16 != old.start_utf16
++            }
++            (None, None) => false,
++            _ => true,
++        };
++        let rectangle = state.ime_pending_rectangle.take().or(area);
++        let moved = rectangle.is_some() && rectangle != state.last_ime_cursor_rectangle;
++        if reset || changed || moved {
++            if let Some(surrounding) = &surrounding {
++                if reset || changed {
++                    use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ChangeCause;
++                    text_input.set_text_change_cause(if !state.ime_external_change && !reset {
++                        ChangeCause::InputMethod
++                    } else {
++                        ChangeCause::Other
++                    });
++                    text_input.set_surrounding_text(
++                        surrounding.text.clone(),
++                        surrounding.cursor as i32,
++                        surrounding.cursor as i32,
++                    );
++                }
++            }
++            if let Some(rectangle) = rectangle {
++                set_ime_cursor_rectangle(&text_input, rectangle);
++                state.last_ime_cursor_rectangle = Some(rectangle);
++            }
++            text_input.commit();
++            state.ime_serial.committed(reset);
++            state.ime_external_change = false;
++        }
++        state.ime_surrounding = surrounding;
++    }
++
++    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
++        let client = self.get_client();
++        client.borrow_mut().ime_pending_rectangle = Some(ImeCursorRectangle::from(bounds));
++        // Flush after the frame's input handler has been restored; querying it
++        // from inside paint can re-enter GPUI with the handler temporarily absent.
+     }
+ 
+     pub fn handle_keyboard_layout_change(&self) {
+@@ -1002,6 +1101,16 @@
+             ime_pre_edit: None,
+             composing: false,
+             last_ime_cursor_rectangle: None,
++            ime_serial: SerialState::default(),
++            ime_pending: Pending::default(),
++            ime_entered: false,
++            ime_context: None,
++            ime_window: None,
++            ime_surrounding: None,
++            ime_observed_surrounding: None,
++            ime_external_change: false,
++            ime_pending_rectangle: None,
++            ime_applying: false,
+             outputs: HashMap::default(),
+             in_progress_outputs,
+             wl_outputs,
+@@ -2072,7 +2181,7 @@
+ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
+     fn event(
+         this: &mut Self,
+-        text_input: &zwp_text_input_v3::ZwpTextInputV3,
++        _text_input: &zwp_text_input_v3::ZwpTextInputV3,
+         event: <zwp_text_input_v3::ZwpTextInputV3 as Proxy>::Event,
+         _: &(),
+         _: &Connection,
+@@ -2082,66 +2191,87 @@
+         let mut state = client.borrow_mut();
+         match event {
+             zwp_text_input_v3::Event::Enter { .. } => {
++                state.ime_entered = true;
+                 drop(state);
+                 this.enable_ime();
+             }
+             zwp_text_input_v3::Event::Leave { .. } => {
++                state.ime_entered = false;
+                 drop(state);
+                 this.disable_ime();
+             }
+             zwp_text_input_v3::Event::CommitString { text } => {
+-                state.composing = false;
+-                let Some(window) = state.keyboard_focused_window.clone() else {
++                state.ime_pending.committed = text;
++            }
++            zwp_text_input_v3::Event::PreeditString {
++                text,
++                cursor_begin,
++                cursor_end,
++            } => {
++                state.ime_pending.preedit = text;
++                state.ime_pending.cursor_begin = cursor_begin;
++                state.ime_pending.cursor_end = cursor_end;
++            }
++            zwp_text_input_v3::Event::DeleteSurroundingText {
++                before_length,
++                after_length,
++            } => {
++                state.ime_pending.before = before_length;
++                state.ime_pending.after = after_length;
++                state.ime_pending.delete_requested = true;
++            }
++            zwp_text_input_v3::Event::Done { serial } => {
++                let pending = std::mem::take(&mut state.ime_pending);
++                // Enable/disable creates a new logical input session. Late replies
++                // from the preceding session must never edit the newly focused view.
++                if !state.ime_entered
++                    || state.ime_enabled != Some(true)
++                    || !state.ime_serial.receive(serial)
++                {
++                    return;
++                }
++                let Some(window) = state.ime_window.clone() else {
+                     return;
+                 };
+-
+-                if let Some(commit_text) = text {
+-                    drop(state);
+-                    // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
+-                    // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
+-                    if commit_text.len() == 1 {
+-                        window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
+-                            keystroke: Keystroke {
+-                                modifiers: Modifiers::default(),
+-                                key: commit_text.clone(),
+-                                key_char: Some(commit_text),
+-                            },
+-                            is_held: false,
+-                            prefer_character_input: false,
+-                        }));
+-                    } else {
+-                        window.handle_ime(ImeInput::InsertText(commit_text));
++                let context = state.ime_context;
++                let supported = state.ime_surrounding.is_some();
++                // Unlike a previous-session reply, a serial mismatch within this
++                // session still applies the received edit. Only outgoing state waits.
++                state.ime_applying = true;
++                drop(state);
++                if window.ime_context() == context && window.accepts_ime() {
++                    if supported {
++                        if !window.apply_surrounding_ime(&pending) {
++                            log::warn!("Rejected unrepresentable Wayland surrounding edit");
++                        }
++                    } else if !pending.delete_requested {
++                        // Preserve the existing Vim command/character-wait path.
++                        window.handle_ime(ImeInput::DeleteText);
++                        if let Some(text) = pending.committed.as_ref() {
++                            if text.len() == 1 {
++                                window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
++                                    keystroke: Keystroke {
++                                        modifiers: Modifiers::default(),
++                                        key: text.clone(),
++                                        key_char: Some(text.clone()),
++                                    },
++                                    is_held: false,
++                                    prefer_character_input: false,
++                                }));
++                            } else {
++                                window.handle_ime(ImeInput::InsertText(text.clone()));
++                            }
++                        }
++                        if let Some(text) = pending.preedit.as_ref() {
++                            window.handle_ime(ImeInput::SetMarkedText(text.clone()));
++                        }
+                     }
+                 }
+-            }
+-            zwp_text_input_v3::Event::PreeditString { text, .. } => {
+-                state.composing = true;
+-                state.ime_pre_edit = text;
+-            }
+-            zwp_text_input_v3::Event::Done { serial } => {
+-                let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
+-                state.serial_tracker.update(SerialKind::InputMethod, serial);
+-                let Some(window) = state.keyboard_focused_window.clone() else {
+-                    return;
+-                };
+-
+-                if let Some(text) = state.ime_pre_edit.take() {
+-                    drop(state);
+-                    window.handle_ime(ImeInput::SetMarkedText(text));
+-                    if let Some(area) = window.get_ime_area() {
+-                        let mut state = client.borrow_mut();
+-                        set_ime_cursor_rectangle_after_done(
+-                            text_input,
+-                            &mut state.last_ime_cursor_rectangle,
+-                            area,
+-                            last_serial.as_raw() == serial,
+-                        );
+-                    }
+-                } else {
+-                    state.composing = false;
+-                    drop(state);
+-                    window.handle_ime(ImeInput::DeleteText);
+-                }
++                let mut state = client.borrow_mut();
++                state.ime_applying = false;
++                state.composing = pending.preedit.as_ref().is_some_and(|s| !s.is_empty());
++                drop(state);
++                this.sync_ime_state(true);
+             }
+             _ => {}
+         }
+--- /dev/null
++++ b/crates/gpui_linux/src/linux/wayland/surrounding.rs
+@@ -0,0 +1,290 @@
++//! UTF-8/UTF-16 boundary handling for text-input-v3 version 1.
++//! This module deliberately has no GPUI dependencies so its protocol arithmetic
++//! can be tested without building the editor.
++use std::ops::Range;
++
++pub const MAX_BYTES: usize = 4000;
++
++/// Counts commits on one protocol object, including enable/disable/geometry.
++#[derive(Default, Debug)]
++pub struct SerialState {
++    sent: u32,
++    session: u32,
++    pub deferred: bool,
++}
++
++impl SerialState {
++    pub fn committed(&mut self, new_session: bool) {
++        self.sent = self.sent.wrapping_add(1);
++        if new_session {
++            self.session = self.sent;
++        }
++    }
++
++    pub fn receive(&mut self, serial: u32) -> bool {
++        if (serial.wrapping_sub(self.session) as i32) < 0 {
++            return false;
++        }
++        self.deferred = serial != self.sent;
++        true
++    }
++}
++
++pub fn utf16_to_byte(text: &str, offset: usize) -> Option<usize> {
++    let mut units = 0;
++    for (byte, ch) in text.char_indices() {
++        if units == offset {
++            return Some(byte);
++        }
++        units += ch.len_utf16();
++        if units > offset {
++            return None;
++        }
++    }
++    (units == offset).then_some(text.len())
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Surrounding {
++    pub text: String,
++    pub cursor: usize,
++    pub start_utf16: usize,
++    pub old_preedit: String,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub struct Edit {
++    pub range: Range<usize>,
++    pub expected: String,
++    pub text: String,
++    pub marked: Range<usize>,
++    pub selection: Range<usize>,
++}
++
++impl Surrounding {
++    /// raw starts at an adjusted UTF-16 document offset.
++    /// Ordinary nonempty selections are intentionally unsupported in this patch.
++    pub fn new(
++        raw: &str,
++        start_utf16: usize,
++        selection: Range<usize>,
++        marked: Option<Range<usize>>,
++    ) -> Option<Self> {
++        if raw.contains('\0') {
++            return None;
++        }
++        let mut text = raw.to_owned();
++        let (cursor_doc, old_preedit) = if let Some(marked) = marked {
++            if marked.start > marked.end
++                || selection.start < marked.start
++                || selection.end > marked.end
++            {
++                return None;
++            }
++            let start = utf16_to_byte(raw, marked.start.checked_sub(start_utf16)?)?;
++            let end = utf16_to_byte(raw, marked.end.checked_sub(start_utf16)?)?;
++            let old = raw.get(start..end)?.to_owned();
++            text.replace_range(start..end, "");
++            (marked.start, old)
++        } else {
++            if selection.start != selection.end {
++                return None;
++            }
++            (selection.start, String::new())
++        };
++        let cursor = utf16_to_byte(&text, cursor_doc.checked_sub(start_utf16)?)?;
++        let mut left = cursor.saturating_sub(MAX_BYTES / 2);
++        while !text.is_char_boundary(left) {
++            left += 1;
++        }
++        let mut right = (left + MAX_BYTES).min(text.len());
++        while !text.is_char_boundary(right) {
++            right -= 1;
++        }
++        // At EOF, use the remaining allowance for text before the cursor.
++        if right == text.len() {
++            left = right.saturating_sub(MAX_BYTES);
++            while !text.is_char_boundary(left) {
++                left += 1;
++            }
++        }
++        let start_utf16 = start_utf16 + text[..left].encode_utf16().count();
++        Some(Self {
++            text: text[left..right].to_owned(),
++            cursor: cursor - left,
++            start_utf16,
++            old_preedit,
++        })
++    }
++
++    pub fn edit(
++        &self,
++        before: u32,
++        after: u32,
++        committed: &str,
++        preedit: &str,
++        cursor_begin: i32,
++        cursor_end: i32,
++    ) -> Option<Edit> {
++        let start = self.cursor.checked_sub(before as usize)?;
++        let end = self.cursor.checked_add(after as usize)?;
++        let prefix = self.text.get(..start)?;
++        let before_text = self.text.get(start..self.cursor)?;
++        let after_text = self.text.get(self.cursor..end)?;
++        let range_start = self.start_utf16 + prefix.encode_utf16().count();
++        let expected = format!("{}{}{}", before_text, self.old_preedit, after_text);
++        let range_end = range_start + expected.encode_utf16().count();
++        let committed_len = committed.encode_utf16().count();
++        let preedit_len = preedit.encode_utf16().count();
++        let cursor = |offset: i32| -> Option<usize> {
++            let offset = usize::try_from(offset).ok()?;
++            Some(committed_len + preedit.get(..offset)?.encode_utf16().count())
++        };
++        // -1/-1 is represented as an invisible caret by the editor.
++        let selection = if cursor_begin == -1 && cursor_end == -1 {
++            committed_len..committed_len
++        } else {
++            cursor(cursor_begin)?..cursor(cursor_end)?
++        };
++        Some(Edit {
++            range: range_start..range_end,
++            expected,
++            text: format!("{}{}", committed, preedit),
++            marked: committed_len..committed_len + preedit_len,
++            selection,
++        })
++    }
++}
++
++#[derive(Default, Debug)]
++pub struct Pending {
++    pub committed: Option<String>,
++    pub preedit: Option<String>,
++    pub cursor_begin: i32,
++    pub cursor_end: i32,
++    pub before: u32,
++    pub after: u32,
++    pub delete_requested: bool,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn serial_mismatch_applies_edits_but_defers_outgoing_state() {
++        let mut serial = SerialState::default();
++        serial.committed(true); // enable + initial state
++        serial.committed(false); // cursor update
++        assert!(serial.receive(1));
++        assert!(serial.deferred);
++        assert!(serial.receive(2));
++        assert!(!serial.deferred);
++        serial.committed(false); // disable
++        serial.committed(true); // enable a different input
++        assert!(!serial.receive(2));
++        assert!(serial.receive(4));
++    }
++
++    #[test]
++    fn serial_counter_wraps_without_resetting_on_enable() {
++        let mut serial = SerialState {
++            sent: u32::MAX - 1,
++            session: u32::MAX - 1,
++            deferred: false,
++        };
++        serial.committed(true);
++        serial.committed(false);
++        assert!(serial.receive(u32::MAX));
++        assert!(serial.deferred);
++        assert!(serial.receive(0));
++        assert!(!serial.deferred);
++        serial.committed(true);
++        assert!(!serial.receive(u32::MAX));
++    }
++
++    #[test]
++    fn unicode_offsets_and_literal_replacement() {
++        let state = Surrounding::new("前😀abc後", 0, 6..6, None).unwrap();
++        assert_eq!(state.cursor, "前😀abc".len());
++        let edit = state.edit(3, 3, "漢字", "", 0, 0).unwrap();
++        assert_eq!(edit.range, 3..7);
++        assert_eq!(edit.expected, "abc後");
++        assert_eq!(edit.text, "漢字");
++        assert_eq!(edit.selection, 2..2);
++    }
++
++    #[test]
++    fn excludes_old_preedit_and_accounts_for_its_document_length() {
++        let state = Surrounding::new("前かな😀後", 10, 14..14, Some(11..15)).unwrap();
++        assert_eq!(state.text, "前後");
++        assert_eq!(state.cursor, "前".len());
++        let edit = state.edit(3, 3, "確定", "あ😀", 3, 7).unwrap();
++        assert_eq!(edit.expected, "前かな😀後");
++        assert_eq!(edit.range, 10..16);
++        assert_eq!(edit.marked, 2..5);
++        assert_eq!(edit.selection, 3..5);
++    }
++
++    #[test]
++    fn rejects_partial_codepoints_surrogates_and_out_of_window_deletes() {
++        assert_eq!(utf16_to_byte("😀", 1), None);
++        let state = Surrounding::new("前😀後", 0, 3..3, None).unwrap();
++        assert!(state.edit(1, 0, "", "", 0, 0).is_none());
++        assert!(state.edit(100, 0, "", "", 0, 0).is_none());
++        assert!(state.edit(0, 0, "", "😀", 1, 1).is_none());
++        assert!(state.edit(0, 0, "", "😀", -1, 0).is_none());
++    }
++
++    #[test]
++    fn truncates_on_boundaries_and_keeps_cursor() {
++        let text = "😀".repeat(3000);
++        for cursor in [0, 2, 3000, 5998, 6000] {
++            let state = Surrounding::new(&text, 0, cursor..cursor, None).unwrap();
++            assert!(state.text.len() <= MAX_BYTES);
++            assert!(state.text.is_char_boundary(state.cursor));
++            assert_eq!(
++                state.start_utf16 + state.text[..state.cursor].encode_utf16().count(),
++                cursor
++            );
++        }
++    }
++
++    #[test]
++    fn selection_and_bad_adjusted_ranges_are_not_advertised() {
++        assert!(Surrounding::new("abc", 0, 0..2, None).is_none());
++        assert!(Surrounding::new("abc", 5, 0..0, None).is_none());
++    }
++
++    #[test]
++    fn empty_commit_and_empty_document_are_valid() {
++        let state = Surrounding::new("", 0, 0..0, None).unwrap();
++        assert_eq!(state.edit(0, 0, "", "", 0, 0).unwrap().range, 0..0);
++    }
++
++    #[test]
++    fn deletion_only_hidden_caret_and_reverse_preedit_selection() {
++        let state = Surrounding::new("abc", 0, 3..3, None).unwrap();
++        let deleted = state.edit(2, 0, "", "", 0, 0).unwrap();
++        assert_eq!(deleted.range, 1..3);
++        assert_eq!(deleted.expected, "bc");
++        let hidden = state.edit(0, 0, "", "😀あ", -1, -1).unwrap();
++        assert_eq!(hidden.selection, 0..0);
++        let reverse = state.edit(0, 0, "", "😀あ", 7, 0).unwrap();
++        assert_eq!(reverse.selection, 3..0);
++        assert!(Surrounding::new("a\0b", 0, 1..1, None).is_none());
++    }
++
++    #[test]
++    fn done_pending_is_taken_and_reset() {
++        let mut pending = Pending {
++            before: 3,
++            committed: Some("x".into()),
++            ..Pending::default()
++        };
++        let received = std::mem::take(&mut pending);
++        assert_eq!(received.before, 3);
++        assert_eq!(pending.before, 0);
++        assert!(pending.committed.is_none());
++    }
++}
+--- a/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -1036,29 +1036,8 @@
+     }
+ 
+     fn update_ime_enabled(&self) {
+-        let mut state = self.state.borrow_mut();
+-        if !state.active {
+-            return;
+-        }
+-        let client = state.client.clone();
+-        let ime_enabled = if let Some(mut input_handler) = state.input_handler.take() {
+-            drop(state);
+-            let accepts_text_input = input_handler.query_accepts_text_input();
+-            self.state.borrow_mut().input_handler = Some(input_handler);
+-            accepts_text_input
+-        } else {
+-            drop(state);
+-            false
+-        };
+-        if Some(ime_enabled) == client.ime_enabled() {
+-            return;
+-        }
+-
+-        if ime_enabled {
+-            client.enable_ime();
+-        } else {
+-            client.disable_ime();
+-        }
++        let client = self.state.borrow().client.clone();
++        client.sync_ime_state(false);
+     }
+ 
+     pub fn handle_xdg_surface_event(&self, event: xdg_surface::Event) {
+@@ -1457,6 +1436,117 @@
+         }
+     }
+ 
++    fn with_ime_handler<T>(&self, f: impl FnOnce(&mut PlatformInputHandler) -> T) -> Option<T> {
++        let mut state = self.state.borrow_mut();
++        let mut handler = state.input_handler.take()?;
++        drop(state);
++        let result = f(&mut handler);
++        self.state.borrow_mut().input_handler = Some(handler);
++        Some(result)
++    }
++
++    pub fn accepts_ime(&self) -> bool {
++        if !self.state.borrow().active {
++            return false;
++        }
++        self.with_ime_handler(|handler| handler.query_accepts_text_input())
++            .unwrap_or(false)
++    }
++
++    pub fn ime_context(&self) -> Option<gpui::EntityId> {
++        self.with_ime_handler(|handler| handler.wayland_input_context())
++            .flatten()
++    }
++
++    pub fn surrounding_text(&self) -> Option<super::surrounding::Surrounding> {
++        self.with_ime_handler(|handler| {
++            if !handler.supports_wayland_surrounding() {
++                return None;
++            }
++            let selected = handler.selected_text_range(false)?.range;
++            let marked = handler.marked_text_range();
++            let left = marked
++                .as_ref()
++                .map_or(selected.start, |m| m.start)
++                .min(selected.start);
++            let right = marked
++                .as_ref()
++                .map_or(selected.end, |m| m.end)
++                .max(selected.end);
++            let requested = left.saturating_sub(2048)..right.saturating_add(2048);
++            let mut adjusted = None;
++            let raw = handler.text_for_range(requested.clone(), &mut adjusted)?;
++            let adjusted = adjusted.unwrap_or(requested);
++            super::surrounding::Surrounding::new(&raw, adjusted.start, selected, marked)
++        })
++        .flatten()
++    }
++
++    pub fn apply_surrounding_ime(&self, pending: &super::surrounding::Pending) -> bool {
++        let Some(state) = self.surrounding_text() else {
++            return false;
++        };
++        let Some(edit) = state.edit(
++            pending.before,
++            pending.after,
++            pending.committed.as_deref().unwrap_or(""),
++            pending.preedit.as_deref().unwrap_or(""),
++            pending.cursor_begin,
++            pending.cursor_end,
++        ) else {
++            return false;
++        };
++        // Avoid empty edits/transactions for state-only or empty-commit done events.
++        if edit.expected == edit.text
++            && edit.marked.is_empty()
++            && state.old_preedit.is_empty()
++            && pending.committed.as_deref().is_none_or(str::is_empty)
++        {
++            return true;
++        }
++        self.with_ime_handler(|handler| {
++            handler.apply_wayland_ime(gpui::WaylandImeEdit {
++                cancel: false,
++                cursor_hidden: pending.cursor_begin == -1 && pending.cursor_end == -1,
++                range: edit.range,
++                expected: edit.expected,
++                text: edit.text,
++                marked: edit.marked,
++                selection: edit.selection,
++                committed: pending
++                    .committed
++                    .clone()
++                    .filter(|s| !s.is_empty() || pending.delete_requested),
++            })
++        })
++        .unwrap_or(false)
++    }
++
++    pub fn cancel_surrounding_preedit(&self) {
++        self.with_ime_handler(|handler| {
++            let Some(range) = handler.marked_text_range() else {
++                return;
++            };
++            let mut adjusted = None;
++            let Some(expected) = handler.text_for_range(range.clone(), &mut adjusted) else {
++                return;
++            };
++            if adjusted.is_some() {
++                return;
++            }
++            handler.apply_wayland_ime(gpui::WaylandImeEdit {
++                cancel: true,
++                cursor_hidden: false,
++                range,
++                expected,
++                text: String::new(),
++                marked: 0..0,
++                selection: 0..0,
++                committed: None,
++            });
++        });
++    }
++
+     pub fn get_ime_area(&self) -> Option<Bounds<Pixels>> {
+         let mut state = self.state.borrow_mut();
+         let mut bounds: Option<Bounds<Pixels>> = None;
+--- a/crates/gpui_linux/src/linux/wayland.rs
++++ b/crates/gpui_linux/src/linux/wayland.rs
+@@ -4,6 +4,7 @@
+ mod display;
+ mod popup;
+ mod serial;
++mod surrounding;
+ mod window;
+ 
+ /// Contains Types for configuring layer_shell surfaces.

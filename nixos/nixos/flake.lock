@@ -1,0 +1,98 @@
+{
+  "nodes": {
+    "arare": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792217349,
+        "narHash": "sha256-fvbgIZL6NFJfniSlYgf6WPf332euzqtZ5tzzwt47Dx8=",
+        "path": "/home/lyshis/arare",
+        "type": "path"
+      },
+      "original": {
+        "path": "/home/lyshis/arare",
+        "type": "path"
+      }
+    },
+    "cskkSrc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1767507174,
+        "narHash": "sha256-olQ0ru5JPx3F0nL+EVR5rmR7nAfceUPSzaATRACJUJU=",
+        "owner": "naokiri",
+        "repo": "cskk",
+        "rev": "bbe34fcde4c314f9e9bb975d0806885ead1b8d8d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "naokiri",
+        "ref": "v3.2.1",
+        "repo": "cskk",
+        "type": "github"
+      }
+    },
+    "fcitx5CskkSrc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1675554076,
+        "narHash": "sha256-rDaFsBXd3he40W27B6641qEfPYBpuw7Rc8JhvsZiPFg=",
+        "owner": "fcitx",
+        "repo": "fcitx5-cskk",
+        "rev": "e73e9137efa5124dee2bab87dbcd7fe2517e7d21",
+        "type": "github"
+      },
+      "original": {
+        "owner": "fcitx",
+        "ref": "v1.2.0",
+        "repo": "fcitx5-cskk",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791765022,
+        "narHash": "sha256-ZGq3ptZzA+oO0N/Wi/F+GbuTijLkYExD01LvpNFAvr0=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7993f34ee47e28a3d607a525aadc6c94b73be728",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs-unstable": {
+      "locked": {
+        "lastModified": 1791734076,
+        "narHash": "sha256-i5qk1kLiit98rRbh1AXmWBNT9QXC/y4l5Wk/u5EdpDQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7fd4004d0511991fff3a0524856a9be09e28c5f0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "arare": "arare",
+        "cskkSrc": "cskkSrc",
+        "fcitx5CskkSrc": "fcitx5CskkSrc",
+        "nixpkgs": "nixpkgs",
+        "nixpkgs-unstable": "nixpkgs-unstable"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
